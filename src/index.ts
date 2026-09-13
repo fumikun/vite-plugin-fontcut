@@ -2,8 +2,15 @@ import path from 'node:path';
 import type { OutputAsset, OutputBundle, PluginContext } from 'rollup';
 import type { Plugin, ResolvedConfig } from 'vite';
 import subsetFont from 'subset-font';
-import { parseFontFaces, setFontFaceSrcUrl, setUnicodeRange, type FontFaceInfo } from './fontFace.js';
+import {
+  expandFontFaceForBuckets,
+  parseFontFaces,
+  setFontFaceSrcUrl,
+  setUnicodeRange,
+  type FontFaceInfo,
+} from './fontFace.js';
 import { findStylesheetHrefs, injectPreloadLinks, type PreloadCandidate } from './preload.js';
+import { splitCharsByBlock } from './scriptBlocks.js';
 import { charsOf, extractContentGlyphs, extractTextFromHtml } from './text.js';
 import { charsToUnicodeRange, codePointInRanges, type Range } from './unicodeRange.js';
 
@@ -52,6 +59,21 @@ export interface FontcutOptions {
    * parsed. Defaults to true.
    */
   preload?: boolean;
+  /**
+   * Split each subsetted font into multiple `@font-face` rules by Unicode
+   * block/script (Latin, Kana, CJK ideographs, Cyrillic, ...), each with its
+   * own `unicode-range` and its own (much smaller) font file, instead of one
+   * file covering every used script. This lets the browser fetch only the
+   * block(s) actually needed to render a given page.
+   *
+   * A rule is left as a single subset (not split) when it already declares
+   * a `unicode-range` (it's already been split upstream, e.g. a pre-split
+   * Google Fonts family) or when it lists more than one locally-hosted
+   * `src` (format fallbacks), since splitting those could produce
+   * mismatched fallback sets. Implies `addUnicodeRange` for the rules it
+   * does split, regardless of that option's value. Defaults to false.
+   */
+  splitByScript?: boolean;
 }
 
 const FONT_MIME: Record<string, string> = {
@@ -133,6 +155,7 @@ export default function fontcut(options: FontcutOptions = {}): Plugin {
     targetFormat,
     verbose = true,
     preload = true,
+    splitByScript = false,
   } = options;
 
   const formatSet = new Set(formats);
@@ -214,6 +237,19 @@ export default function fontcut(options: FontcutOptions = {}): Plugin {
         }
       }
 
+      // Track how many distinct locally-hosted font assets back each
+      // @font-face rule, so splitByScript can skip rules with format
+      // fallbacks (splitting those independently could produce mismatched
+      // fallback sets across formats).
+      const atRuleAssetCounts = new Map<Occurrence['atRule'], Set<string>>();
+      for (const [assetFileName, occurrences] of occurrencesByAsset) {
+        for (const occurrence of occurrences) {
+          const set = atRuleAssetCounts.get(occurrence.atRule) ?? new Set<string>();
+          set.add(assetFileName);
+          atRuleAssetCounts.set(occurrence.atRule, set);
+        }
+      }
+
       // 4. Subset each unique font asset.
       const stats: Array<{ family: string; file: string; before: number; after: number }> = [];
       const finalFileNameByOriginal = new Map<string, string>();
@@ -243,68 +279,149 @@ export default function fontcut(options: FontcutOptions = {}): Plugin {
         const nativeFormat = EXT_TO_FORMAT[ext];
         const outputFormat = targetFormat ?? nativeFormat;
 
-        let subsetBuffer: Buffer;
-        try {
-          subsetBuffer = await subsetFont(originalBuffer, Array.from(charsForFont).join(''), {
-            targetFormat: outputFormat,
+        const canSplit =
+          splitByScript &&
+          !declaredRanges &&
+          occurrences.every((o) => (atRuleAssetCounts.get(o.atRule)?.size ?? 1) === 1);
+        const scriptBuckets = canSplit ? splitCharsByBlock(charsForFont) : null;
+
+        if (!scriptBuckets || scriptBuckets.size <= 1) {
+          // Single-subset path.
+          let subsetBuffer: Buffer;
+          try {
+            subsetBuffer = await subsetFont(originalBuffer, Array.from(charsForFont).join(''), {
+              targetFormat: outputFormat,
+            });
+          } catch (error) {
+            this.warn(
+              `vite-plugin-fontcut: failed to subset ${assetFileName}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            continue;
+          }
+
+          if (subsetBuffer.byteLength >= originalBuffer.byteLength) {
+            if (verbose) {
+              this.warn(
+                `vite-plugin-fontcut: subset of ${assetFileName} was not smaller than the original, keeping the original.`,
+              );
+            }
+            continue;
+          }
+
+          let finalFileName = assetFileName;
+          if (outputFormat !== nativeFormat) {
+            const newExt = FORMAT_TO_EXT[outputFormat];
+            finalFileName = assetFileName.slice(0, -ext.length) + newExt;
+          }
+
+          if (finalFileName === assetFileName) {
+            bundleAsset.source = subsetBuffer;
+          } else {
+            delete bundle[assetFileName];
+            bundle[finalFileName] = {
+              type: 'asset',
+              fileName: finalFileName,
+              name: bundleAsset.name,
+              source: subsetBuffer,
+            } as unknown as OutputAsset;
+
+            const oldBaseName = path.posix.basename(assetFileName);
+            const newBaseName = path.posix.basename(finalFileName);
+            for (const occurrence of occurrences) {
+              const newUrl = occurrence.url.replace(oldBaseName, newBaseName);
+              setFontFaceSrcUrl(occurrence.atRule, occurrence.url, newUrl);
+            }
+            finalFileNameByOriginal.set(assetFileName, finalFileName);
+          }
+
+          if (addUnicodeRange) {
+            const rangeValue = charsToUnicodeRange(charsForFont);
+            for (const occurrence of occurrences) {
+              setUnicodeRange(occurrence.atRule, rangeValue);
+            }
+          }
+
+          stats.push({
+            family: occurrences[0]?.family ?? assetFileName,
+            file: assetFileName,
+            before: originalBuffer.byteLength,
+            after: subsetBuffer.byteLength,
           });
-        } catch (error) {
-          this.warn(
-            `vite-plugin-fontcut: failed to subset ${assetFileName}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
           continue;
         }
 
-        if (subsetBuffer.byteLength >= originalBuffer.byteLength) {
+        // Split-subset path: one subset file + one @font-face rule per
+        // populated Unicode block, each scoped with its own unicode-range so
+        // the browser only fetches the block(s) it actually needs.
+        const finalExt = outputFormat === nativeFormat ? ext : FORMAT_TO_EXT[outputFormat];
+        const oldBaseName = path.posix.basename(assetFileName);
+        const stem = oldBaseName.slice(0, -ext.length);
+        const dir = path.posix.dirname(assetFileName);
+
+        const bucketOutputs: Array<{ id: string; fileName: string; buffer: Buffer; chars: Set<string> }> = [];
+        for (const [bucketId, bucketChars] of scriptBuckets) {
+          let subsetBuffer: Buffer;
+          try {
+            subsetBuffer = await subsetFont(originalBuffer, Array.from(bucketChars).join(''), {
+              targetFormat: outputFormat,
+            });
+          } catch (error) {
+            this.warn(
+              `vite-plugin-fontcut: failed to subset ${assetFileName} (${bucketId}): ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            continue;
+          }
+          if (subsetBuffer.byteLength >= originalBuffer.byteLength) continue;
+
+          const bucketFileName = (dir === '.' ? '' : `${dir}/`) + `${stem}-${bucketId}${finalExt}`;
+          bucketOutputs.push({ id: bucketId, fileName: bucketFileName, buffer: subsetBuffer, chars: bucketChars });
+        }
+
+        if (bucketOutputs.length === 0) {
           if (verbose) {
             this.warn(
-              `vite-plugin-fontcut: subset of ${assetFileName} was not smaller than the original, keeping the original.`,
+              `vite-plugin-fontcut: no split subset of ${assetFileName} was smaller than the original, keeping the original.`,
             );
           }
           continue;
         }
 
-        let finalFileName = assetFileName;
-        if (outputFormat !== nativeFormat) {
-          const newExt = FORMAT_TO_EXT[outputFormat];
-          finalFileName = assetFileName.slice(0, -ext.length) + newExt;
-        }
-
-        if (finalFileName === assetFileName) {
-          bundleAsset.source = subsetBuffer;
-        } else {
-          delete bundle[assetFileName];
-          bundle[finalFileName] = {
+        delete bundle[assetFileName];
+        for (const bucket of bucketOutputs) {
+          bundle[bucket.fileName] = {
             type: 'asset',
-            fileName: finalFileName,
+            fileName: bucket.fileName,
             name: bundleAsset.name,
-            source: subsetBuffer,
+            source: bucket.buffer,
           } as unknown as OutputAsset;
+        }
+        // Only the first (and usually most broadly useful) block is
+        // preloaded — see the preload step below.
+        finalFileNameByOriginal.set(assetFileName, bucketOutputs[0].fileName);
 
-          const oldBaseName = path.posix.basename(assetFileName);
-          const newBaseName = path.posix.basename(finalFileName);
-          for (const occurrence of occurrences) {
-            const newUrl = occurrence.url.replace(oldBaseName, newBaseName);
-            setFontFaceSrcUrl(occurrence.atRule, occurrence.url, newUrl);
-          }
-          finalFileNameByOriginal.set(assetFileName, finalFileName);
+        for (const occurrence of occurrences) {
+          expandFontFaceForBuckets(
+            occurrence.atRule,
+            occurrence.url,
+            bucketOutputs.map((b) => ({
+              url: occurrence.url.replace(oldBaseName, path.posix.basename(b.fileName)),
+              unicodeRange: charsToUnicodeRange(b.chars),
+            })),
+          );
         }
 
-        if (addUnicodeRange) {
-          const rangeValue = charsToUnicodeRange(charsForFont);
-          for (const occurrence of occurrences) {
-            setUnicodeRange(occurrence.atRule, rangeValue);
-          }
+        for (const bucket of bucketOutputs) {
+          stats.push({
+            family: `${occurrences[0]?.family ?? assetFileName} [${bucket.id}]`,
+            file: bucket.fileName,
+            before: originalBuffer.byteLength,
+            after: bucket.buffer.byteLength,
+          });
         }
-
-        stats.push({
-          family: occurrences[0]?.family ?? assetFileName,
-          file: assetFileName,
-          before: originalBuffer.byteLength,
-          after: subsetBuffer.byteLength,
-        });
       }
 
       // 5. Write the mutated CSS ASTs back to the bundle.

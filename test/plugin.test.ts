@@ -204,4 +204,80 @@ describe('vite-plugin-fontcut (integration)', () => {
     expect(subsetFont.hasGlyphForCodePoint('世'.codePointAt(0)!)).toBe(true);
     expect(subsetFont.hasGlyphForCodePoint('日'.codePointAt(0)!)).toBe(false);
   });
+
+  it('splits a font into per-script @font-face rules when splitByScript is enabled', async () => {
+    const root = path.join(tmpDir, 'project');
+    writeProject(root);
+    const outDir = path.join(tmpDir, 'dist');
+
+    await build({
+      root,
+      logLevel: 'silent',
+      plugins: [fontcut({ verbose: false, splitByScript: true })],
+      build: { outDir, write: true },
+    });
+
+    const cssPath = findAsset(outDir, /\.css$/);
+    const css = fs.readFileSync(cssPath, 'utf8');
+    const faceBlocks = css.match(/@font-face\s*\{[^}]*\}/g) ?? [];
+
+    // The fixture page uses both Latin ("Hello World") and Japanese
+    // ("こんにちは世界") text, so splitting should produce (at least) a
+    // "latin" and a "kana"/"cjk" rule instead of a single one.
+    expect(faceBlocks.length).toBeGreaterThan(1);
+
+    const ranges = faceBlocks.map((block) => block.match(/unicode-range:\s*([^;}]+)/)?.[1]);
+    expect(ranges.every((r) => !!r)).toBe(true);
+    // Every rule's unicode-range must be distinct from the others.
+    expect(new Set(ranges).size).toBe(ranges.length);
+
+    const assetsDir = path.join(outDir, 'assets');
+    const fontFiles = fs.readdirSync(assetsDir).filter((f) => f.endsWith('.woff2'));
+    expect(fontFiles.length).toBe(faceBlocks.length);
+
+    // Each split file must still shrink relative to the original font, and
+    // each @font-face rule's src must point at one of the split files.
+    for (const file of fontFiles) {
+      const size = fs.statSync(path.join(assetsDir, file)).size;
+      expect(size).toBeLessThan(fs.statSync(FIXTURE_FONT).size * 0.05);
+    }
+    for (const block of faceBlocks) {
+      const src = block.match(/src:\s*url\(['"]?([^'")]+)['"]?\)/)?.[1];
+      expect(src).toBeTruthy();
+      expect(fontFiles.some((f) => src!.endsWith(f))).toBe(true);
+    }
+  });
+
+  it('does not split a font whose @font-face already declares a unicode-range', async () => {
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root, { recursive: true });
+    fs.copyFileSync(FIXTURE_FONT, path.join(root, path.basename(FIXTURE_FONT)));
+    fs.writeFileSync(
+      path.join(root, 'index.html'),
+      `<!doctype html><html><head><link rel="stylesheet" href="/style.css"></head><body><h1>こんにちは世界 Hello</h1></body></html>`,
+    );
+    fs.writeFileSync(
+      path.join(root, 'style.css'),
+      `@font-face {
+  font-family: 'Noto Sans JP Test';
+  src: url('./${path.basename(FIXTURE_FONT)}') format('woff2');
+  unicode-range: U+0000-FFFF;
+}
+body { font-family: 'Noto Sans JP Test', sans-serif; }
+`,
+    );
+    const outDir = path.join(tmpDir, 'dist');
+
+    await build({
+      root,
+      logLevel: 'silent',
+      plugins: [fontcut({ verbose: false, splitByScript: true })],
+      build: { outDir, write: true },
+    });
+
+    const cssPath = findAsset(outDir, /\.css$/);
+    const css = fs.readFileSync(cssPath, 'utf8');
+    const faceBlocks = css.match(/@font-face\s*\{[^}]*\}/g) ?? [];
+    expect(faceBlocks.length).toBe(1);
+  });
 });

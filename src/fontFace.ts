@@ -104,3 +104,32 @@ export function setUnicodeRange(atRule: AtRule, value: string): void {
     atRule.append({ prop: 'unicode-range', value });
   }
 }
+
+/**
+ * Expands a single `@font-face` rule into one rule per entry in
+ * `bucketOutputs` — used to split a font that was subsetted into several
+ * per-script/unicode-block files. The first entry reuses `atRule` in place;
+ * every subsequent entry is a clone inserted immediately after the previous
+ * one, so declaration order in the stylesheet matches `bucketOutputs` order.
+ */
+export function expandFontFaceForBuckets(
+  atRule: AtRule,
+  oldUrl: string,
+  bucketOutputs: Array<{ url: string; unicodeRange: string }>,
+): void {
+  if (bucketOutputs.length === 0) return;
+
+  const clones = bucketOutputs.slice(1).map(() => atRule.clone());
+
+  setFontFaceSrcUrl(atRule, oldUrl, bucketOutputs[0].url);
+  setUnicodeRange(atRule, bucketOutputs[0].unicodeRange);
+
+  let anchor: AtRule = atRule;
+  for (let i = 1; i < bucketOutputs.length; i++) {
+    const clone = clones[i - 1];
+    setFontFaceSrcUrl(clone, oldUrl, bucketOutputs[i].url);
+    setUnicodeRange(clone, bucketOutputs[i].unicodeRange);
+    anchor.after(clone);
+    anchor = clone;
+  }
+}

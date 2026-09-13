@@ -86,6 +86,16 @@ fontcut({
 
   // Log a size-reduction summary after the build. Defaults to true.
   verbose: true,
+
+  // Split each subsetted font into multiple @font-face rules by Unicode
+  // block/script (Latin, Kana, CJK ideographs, Cyrillic, ...), each scoped
+  // with its own unicode-range and its own (smaller) font file, instead of
+  // one file covering every used script. Useful for pages that mix scripts
+  // (e.g. Latin UI chrome + CJK body text), so the browser only fetches the
+  // block(s) it actually needs. A rule that already declares a
+  // unicode-range, or that has more than one local src (format fallbacks),
+  // is left as a single subset. Defaults to false.
+  splitByScript: false,
 })
 ```
 
@@ -104,6 +114,9 @@ fontcut({
   end up keeping a few extra glyphs in each.
 - Content injected purely by client-side JavaScript after the initial HTML is
   not seen automatically — use `additionalText` for that.
+- With `splitByScript`, only the first generated block is preloaded (see
+  `preload`) rather than every split file, to avoid fetching blocks a given
+  page may not need.
 
 ## Example
 

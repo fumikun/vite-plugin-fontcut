@@ -27,8 +27,8 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
+    "build": "vite build",
+    "dev": "vite build --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepublishOnly": "npm run build"
@@ -45,9 +45,9 @@
     "@types/fontkit": "^2.0.9",
     "@types/node": "^22.10.0",
     "fontkit": "^2.0.4",
-    "tsup": "^8.3.5",
     "typescript": "^5.7.2",
     "vite": "^6.0.0",
+    "vite-plugin-dts": "^5.1.0",
     "vitest": "^3.2.4"
   }
 }
