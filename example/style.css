@@ -1,0 +1,11 @@
+@font-face {
+  font-family: 'Noto Sans JP Example';
+  font-style: normal;
+  font-weight: 400;
+  src: url('../test/fixtures/NotoSansJP-Regular.woff2') format('woff2');
+}
+
+body {
+  font-family: 'Noto Sans JP Example', sans-serif;
+  margin: 2rem;
+}
