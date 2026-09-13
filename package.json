@@ -31,6 +31,9 @@
     "dev": "vite build --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs",
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
@@ -48,6 +51,7 @@
     "typescript": "^5.7.2",
     "vite": "^6.0.0",
     "vite-plugin-dts": "^5.1.0",
+    "vitepress": "^1.6.4",
     "vitest": "^3.2.4"
   }
 }
