@@ -1,5 +1,5 @@
 import { defineConfig } from 'vite';
-import subfont from '../src/index.js';
+import fontcut from '../src/index.js';
 
 export default defineConfig({
   server: {
@@ -10,5 +10,5 @@ export default defineConfig({
   build: {
     outDir: 'dist',
   },
-  plugins: [subfont()],
+  plugins: [fontcut()],
 });

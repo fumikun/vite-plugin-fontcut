@@ -1,5 +1,5 @@
 {
-  "name": "vite-plugin-subfont",
+  "name": "vite-plugin-fontcut",
   "version": "0.1.0",
   "description": "Vite plugin that subsets self-hosted webfonts to only the glyphs actually used in your built HTML/CSS.",
   "type": "module",
@@ -9,7 +9,7 @@
     "vite-plugin",
     "font",
     "subset",
-    "subfont",
+    "fontcut",
     "woff2",
     "webfont"
   ],

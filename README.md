@@ -1,4 +1,4 @@
-# vite-plugin-subfont
+# vite-plugin-fontcut
 
 A Vite plugin that subsets self-hosted webfonts down to only the glyphs
 actually used in your built site, using [HarfBuzz](https://harfbuzz.github.io/)
@@ -22,7 +22,7 @@ kilobytes.
 ## Install
 
 ```sh
-npm install --save-dev vite-plugin-subfont
+npm install --save-dev vite-plugin-fontcut
 ```
 
 ## Usage
@@ -30,10 +30,10 @@ npm install --save-dev vite-plugin-subfont
 ```ts
 // vite.config.ts
 import { defineConfig } from 'vite';
-import subfont from 'vite-plugin-subfont';
+import fontcut from 'vite-plugin-fontcut';
 
 export default defineConfig({
-  plugins: [subfont()],
+  plugins: [fontcut()],
 });
 ```
 
@@ -64,7 +64,7 @@ splits are preserved.
 ## Options
 
 ```ts
-subfont({
+fontcut({
   // Extra text to keep glyphs for, e.g. client-rendered strings.
   additionalText: 'Loading… ',
 

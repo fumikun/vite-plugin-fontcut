@@ -4,7 +4,7 @@ import path from 'node:path';
 import * as fontkit from 'fontkit';
 import { build } from 'vite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import subfont from '../src/index.js';
+import fontcut from '../src/index.js';
 
 const FIXTURE_FONT = path.resolve(__dirname, 'fixtures/NotoSansJP-Regular.woff2');
 const FIXTURE_OTF = path.resolve(__dirname, 'fixtures/NotoSansJP-Regular.otf');
@@ -59,11 +59,11 @@ function findAsset(distDir: string, pattern: RegExp): string {
   return path.join(assetsDir, match);
 }
 
-describe('vite-plugin-subfont (integration)', () => {
+describe('vite-plugin-fontcut (integration)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vite-plugin-subfont-'));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vite-plugin-fontcut-'));
   });
 
   afterEach(() => {
@@ -78,7 +78,7 @@ describe('vite-plugin-subfont (integration)', () => {
     await build({
       root,
       logLevel: 'silent',
-      plugins: [subfont({ verbose: false })],
+      plugins: [fontcut({ verbose: false })],
       build: { outDir, write: true },
     });
 
@@ -115,7 +115,7 @@ describe('vite-plugin-subfont (integration)', () => {
     await build({
       root,
       logLevel: 'silent',
-      plugins: [subfont({ verbose: false })],
+      plugins: [fontcut({ verbose: false })],
       build: { outDir, write: true },
     });
 
@@ -128,6 +128,44 @@ describe('vite-plugin-subfont (integration)', () => {
     expect(rangeMatch).not.toBeNull();
   });
 
+  it('preloads the subsetted font referenced by the page stylesheet', async () => {
+    const root = path.join(tmpDir, 'project');
+    writeProject(root);
+    const outDir = path.join(tmpDir, 'dist');
+
+    await build({
+      root,
+      logLevel: 'silent',
+      plugins: [fontcut({ verbose: false })],
+      build: { outDir, write: true },
+    });
+
+    const fontPath = findAsset(outDir, /NotoSansJP-Regular.*\.woff2$/);
+    const fontHref = '/assets/' + path.basename(fontPath);
+    const html = fs.readFileSync(path.join(outDir, 'index.html'), 'utf8');
+
+    expect(html).toContain(`<link rel="preload" as="font" type="font/woff2" href="${fontHref}" crossorigin>`);
+    // The preload tag should come before the stylesheet link that would
+    // otherwise be the first thing to discover the font.
+    expect(html.indexOf('rel="preload"')).toBeLessThan(html.indexOf('rel="stylesheet"'));
+  });
+
+  it('does not inject a preload link when preload is disabled', async () => {
+    const root = path.join(tmpDir, 'project');
+    writeProject(root);
+    const outDir = path.join(tmpDir, 'dist');
+
+    await build({
+      root,
+      logLevel: 'silent',
+      plugins: [fontcut({ verbose: false, preload: false })],
+      build: { outDir, write: true },
+    });
+
+    const html = fs.readFileSync(path.join(outDir, 'index.html'), 'utf8');
+    expect(html).not.toContain('rel="preload"');
+  });
+
   it('leaves the font untouched when its family matches the exclude option', async () => {
     const root = path.join(tmpDir, 'project');
     writeProject(root);
@@ -136,7 +174,7 @@ describe('vite-plugin-subfont (integration)', () => {
     await build({
       root,
       logLevel: 'silent',
-      plugins: [subfont({ verbose: false, exclude: ['Noto Sans JP Test'] })],
+      plugins: [fontcut({ verbose: false, exclude: ['Noto Sans JP Test'] })],
       build: { outDir, write: true },
     });
 
@@ -154,7 +192,7 @@ describe('vite-plugin-subfont (integration)', () => {
     await build({
       root,
       logLevel: 'silent',
-      plugins: [subfont({ verbose: false })],
+      plugins: [fontcut({ verbose: false })],
       build: { outDir, write: true },
     });
 

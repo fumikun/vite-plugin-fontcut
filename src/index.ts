@@ -3,12 +3,13 @@ import type { OutputAsset, OutputBundle, PluginContext } from 'rollup';
 import type { Plugin, ResolvedConfig } from 'vite';
 import subsetFont from 'subset-font';
 import { parseFontFaces, setFontFaceSrcUrl, setUnicodeRange, type FontFaceInfo } from './fontFace.js';
+import { findStylesheetHrefs, injectPreloadLinks, type PreloadCandidate } from './preload.js';
 import { charsOf, extractContentGlyphs, extractTextFromHtml } from './text.js';
 import { charsToUnicodeRange, codePointInRanges, type Range } from './unicodeRange.js';
 
-export type SubfontFormat = 'woff2' | 'woff' | 'sfnt';
+export type FontcutFormat = 'woff2' | 'woff' | 'sfnt';
 
-export interface SubfontOptions {
+export interface FontcutOptions {
   /**
    * Extra text that should be treated as "used" even though it doesn't
    * appear in the built HTML â€” e.g. strings rendered client-side by JS
@@ -40,19 +41,34 @@ export interface SubfontOptions {
    * Force all subsetted fonts to be re-encoded to this container format
    * instead of keeping their original one.
    */
-  targetFormat?: SubfontFormat;
+  targetFormat?: FontcutFormat;
   /** Log a summary of the subsetting results. Defaults to true. */
   verbose?: boolean;
+  /**
+   * Inject `<link rel="preload" as="font" crossorigin>` tags into `<head>`
+   * for the first locally-hosted `src` of every @font-face rule used by a
+   * page's stylesheets, so the browser starts fetching the (now tiny)
+   * subsetted font as soon as possible instead of waiting for the CSS to be
+   * parsed. Defaults to true.
+   */
+  preload?: boolean;
 }
 
-const EXT_TO_FORMAT: Record<string, SubfontFormat> = {
+const FONT_MIME: Record<string, string> = {
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+};
+
+const EXT_TO_FORMAT: Record<string, FontcutFormat> = {
   '.woff2': 'woff2',
   '.woff': 'woff',
   '.ttf': 'sfnt',
   '.otf': 'sfnt',
 };
 
-const FORMAT_TO_EXT: Record<SubfontFormat, string> = {
+const FORMAT_TO_EXT: Record<FontcutFormat, string> = {
   woff2: '.woff2',
   woff: '.woff',
   sfnt: '.ttf',
@@ -107,7 +123,7 @@ function isExcluded(family: string | undefined, patterns: Array<string | RegExp>
   );
 }
 
-export default function subfont(options: SubfontOptions = {}): Plugin {
+export default function fontcut(options: FontcutOptions = {}): Plugin {
   const {
     additionalText = '',
     alwaysInclude = ' ',
@@ -116,13 +132,14 @@ export default function subfont(options: SubfontOptions = {}): Plugin {
     addUnicodeRange = true,
     targetFormat,
     verbose = true,
+    preload = true,
   } = options;
 
   const formatSet = new Set(formats);
   let resolvedConfig: ResolvedConfig;
 
   return {
-    name: 'vite-plugin-subfont',
+    name: 'vite-plugin-fontcut',
     apply: 'build',
     enforce: 'post',
 
@@ -161,7 +178,7 @@ export default function subfont(options: SubfontOptions = {}): Plugin {
       });
 
       if (usedChars.size === 0) {
-        this.warn('vite-plugin-subfont: no text found in the built HTML/CSS; skipping font subsetting.');
+        this.warn('vite-plugin-fontcut: no text found in the built HTML/CSS; skipping font subsetting.');
         return;
       }
       for (const char of alwaysInclude) usedChars.add(char);
@@ -199,8 +216,10 @@ export default function subfont(options: SubfontOptions = {}): Plugin {
 
       // 4. Subset each unique font asset.
       const stats: Array<{ family: string; file: string; before: number; after: number }> = [];
+      const finalFileNameByOriginal = new Map<string, string>();
 
       for (const [assetFileName, occurrences] of occurrencesByAsset) {
+        finalFileNameByOriginal.set(assetFileName, assetFileName);
         const bundleAsset = bundle[assetFileName] as OutputAsset;
         const originalBuffer = Buffer.from(
           typeof bundleAsset.source === 'string' ? Buffer.from(bundleAsset.source) : bundleAsset.source,
@@ -216,7 +235,7 @@ export default function subfont(options: SubfontOptions = {}): Plugin {
         }
 
         if (charsForFont.size === 0) {
-          if (verbose) this.warn(`vite-plugin-subfont: no used characters match ${assetFileName}, skipping.`);
+          if (verbose) this.warn(`vite-plugin-fontcut: no used characters match ${assetFileName}, skipping.`);
           continue;
         }
 
@@ -231,7 +250,7 @@ export default function subfont(options: SubfontOptions = {}): Plugin {
           });
         } catch (error) {
           this.warn(
-            `vite-plugin-subfont: failed to subset ${assetFileName}: ${
+            `vite-plugin-fontcut: failed to subset ${assetFileName}: ${
               error instanceof Error ? error.message : String(error)
             }`,
           );
@@ -241,7 +260,7 @@ export default function subfont(options: SubfontOptions = {}): Plugin {
         if (subsetBuffer.byteLength >= originalBuffer.byteLength) {
           if (verbose) {
             this.warn(
-              `vite-plugin-subfont: subset of ${assetFileName} was not smaller than the original, keeping the original.`,
+              `vite-plugin-fontcut: subset of ${assetFileName} was not smaller than the original, keeping the original.`,
             );
           }
           continue;
@@ -270,6 +289,7 @@ export default function subfont(options: SubfontOptions = {}): Plugin {
             const newUrl = occurrence.url.replace(oldBaseName, newBaseName);
             setFontFaceSrcUrl(occurrence.atRule, occurrence.url, newUrl);
           }
+          finalFileNameByOriginal.set(assetFileName, finalFileName);
         }
 
         if (addUnicodeRange) {
@@ -293,11 +313,58 @@ export default function subfont(options: SubfontOptions = {}): Plugin {
         asset.source = root.toString();
       }
 
+      // 6. Preload the first locally-hosted src of every @font-face rule, so
+      // the browser fetches the (now tiny) font without waiting on the CSS.
+      if (preload) {
+        const base = resolvedConfig?.base ?? '/';
+        const preloadCandidatesByCss = new Map<string, PreloadCandidate[]>();
+
+        for (const { asset, faces } of parsedCss) {
+          const seen = new Set<string>();
+          const candidates: PreloadCandidate[] = [];
+          for (const face of faces) {
+            const firstLocalSrc = face.srcs[0];
+            if (!firstLocalSrc) continue;
+            const resolved = resolveBundleFileName(asset.fileName, firstLocalSrc.url, base, bundleKeys);
+            if (!resolved) continue;
+            const finalFileName = finalFileNameByOriginal.get(resolved) ?? resolved;
+            if (seen.has(finalFileName)) continue;
+            seen.add(finalFileName);
+            const ext = path.posix.extname(finalFileName).toLowerCase();
+            const type = FONT_MIME[ext];
+            if (!type) continue;
+            const href = base.replace(/\/+$/, '') + '/' + finalFileName;
+            candidates.push({ href, type });
+          }
+          if (candidates.length > 0) preloadCandidatesByCss.set(asset.fileName, candidates);
+        }
+
+        for (const html of htmlAssets) {
+          const source =
+            typeof html.source === 'string' ? html.source : Buffer.from(html.source).toString('utf8');
+          const cssHrefs = findStylesheetHrefs(source);
+          const candidates: PreloadCandidate[] = [];
+          const seenHrefs = new Set<string>();
+          for (const cssHref of cssHrefs) {
+            const resolvedCss = resolveBundleFileName(html.fileName, cssHref, base, bundleKeys);
+            if (!resolvedCss) continue;
+            for (const candidate of preloadCandidatesByCss.get(resolvedCss) ?? []) {
+              if (seenHrefs.has(candidate.href)) continue;
+              seenHrefs.add(candidate.href);
+              candidates.push(candidate);
+            }
+          }
+          if (candidates.length > 0) {
+            html.source = injectPreloadLinks(source, candidates);
+          }
+        }
+      }
+
       if (verbose && stats.length > 0) {
         const totalBefore = stats.reduce((sum, s) => sum + s.before, 0);
         const totalAfter = stats.reduce((sum, s) => sum + s.after, 0);
         this.warn(
-          `vite-plugin-subfont: subsetted ${stats.length} font(s), ${formatBytes(totalBefore)} -> ${formatBytes(
+          `vite-plugin-fontcut: subsetted ${stats.length} font(s), ${formatBytes(totalBefore)} -> ${formatBytes(
             totalAfter,
           )} (${((1 - totalAfter / totalBefore) * 100).toFixed(1)}% smaller).\n` +
             stats
